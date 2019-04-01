@@ -7,14 +7,13 @@ import argparse
 
 """
 Port of original gstwebrtc-demo with backward compatibility for python 2.7
-It relies on websocket-client from https://github.com/websocket-client/websocket-client
-And we are running a GLib mainloop, so we could add Gtk UI later
+It relies on libSoup 2.50, for webSockets connection
+
 """
-
-import glibwebsocket
-from gi.repository import GLib, GObject
-
 import gi
+gi.require_version('Soup', '2.4')
+from gi.repository import Gio, Soup, GLib, GObject
+
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 gi.require_version('GstWebRTC', '1.0')
@@ -63,21 +62,20 @@ class WebRTCClient:
         self.mainloop = None
         self.peer_id = peer_id
         self.state = AppState.APP_STATE_UNKNOWN
-        self.server = server or 'wss://webrtc.nirbheek.in:8443'
+        self.server = server or 'https://webrtc.nirbheek.in:8443'
+        self.session = Soup.Session()
 
-    def on_open(self):
-        print('Socket is open')
-        self.state = AppState.SERVER_CONNECTED
 
-    def on_error(self, error):
+    def on_error(self, ws, error):
         print('Socket got error:', error)
 
-    def on_close(self):
+    def on_close(self, ws):
         print('Socket is closed')
         self.state = AppState.SERVER_CLOSED
 
-    def on_message(self, message):
-        # print('Socket got message:', message)
+    def on_message(self, ws, type, msg):
+        message = msg.get_data()
+        print('Socket got message:', message)
         if message == 'HELLO':
             if self.state != AppState.SERVER_REGISTERING:
                 print('ERROR: Received HELLO when not registering')
@@ -127,22 +125,29 @@ class WebRTCClient:
     def cleanup_and_quit_loop(self):
         self.mainloop.quit()
 
-    def connect(self):
-        self.conn = glibwebsocket.GLibWebSocketApp(self.server,
-                on_open = self.on_open,
-                on_message = self.on_message,
-                on_error = self.on_error,
-                on_close = self.on_close)
 
-        self.state = AppState.SERVER_CONNECTING
-        self.conn.run(sslopt={'cert_reqs': ssl.CERT_NONE})
+    def connect_result(self, source, result):
+        self.conn = source.websocket_connect_finish(result)
+
+        self.state = AppState.SERVER_CONNECTED
+        self.conn.connect('error', self.on_error)
+        self.conn.connect('message', self.on_message)
+        self.conn.connect('closed', self.on_close)
 
         self.state = AppState.SERVER_REGISTERING
-        self.conn.send('HELLO %d' % self.id_)
+        self.conn.send_text('HELLO %d' % self.id_)
+
+
+    def connect(self):
+        self.state = AppState.SERVER_CONNECTING
+        request = self.session.request(self.server)
+        msg = request.get_message()
+        self.session.websocket_connect_async(msg, None, None, None, self.connect_result)
+
 
     def setup_call(self):
         self.state = AppState.PEER_CONNECTING
-        self.conn.send('SESSION {}'.format(self.peer_id))
+        self.conn.send_text('SESSION {}'.format(self.peer_id))
 
     def send_sdp_offer(self, offer):
         if self.state != AppState.PEER_CALL_NEGOTIATING:
@@ -153,7 +158,7 @@ class WebRTCClient:
         text = offer.sdp.as_text()
         print ('Sending offer:\n%s' % text)
         msg = json.dumps({'sdp': {'type': 'offer', 'sdp': text}})
-        self.conn.send(msg)
+        self.conn.send_text(msg)
 
     def on_offer_created(self, promise, _, __):
         if self.state != AppState.PEER_CALL_NEGOTIATING:
@@ -181,7 +186,7 @@ class WebRTCClient:
             return
 
         icemsg = json.dumps({'ice': {'candidate': candidate, 'sdpMLineIndex': mlineindex}})
-        self.conn.send(icemsg)
+        self.conn.send_text(icemsg)
 
     def on_incoming_decodebin_stream(self, _, pad):
         if not pad.has_current_caps():
